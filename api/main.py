@@ -54,6 +54,26 @@ async def lifespan(app: FastAPI):
     log.info("Starting EY ME Agentic RAG API")
     get_graph()
     get_memory()
+
+    # Pre-warm the ColPali model at startup (NOT during the first request) so
+    # the heavy ~5GB model load can't time out a /chat call. Runs in a thread
+    # so it doesn't block the event loop while the model loads.
+    if settings.colpali_enabled:
+        import asyncio
+        from agent.tools import _get_colpali_embedder
+
+        async def _warm():
+            try:
+                emb = _get_colpali_embedder()
+                if emb is not None:
+                    log.info("Pre-warming ColPali model (one-time, may take ~1 min)…")
+                    await asyncio.to_thread(emb._get_model)
+                    log.info("ColPali model ready.")
+            except Exception as exc:
+                log.warning("ColPali pre-warm failed; visual retrieval disabled", error=str(exc))
+
+        asyncio.create_task(_warm())
+
     yield
     log.info("Shutting down")
 

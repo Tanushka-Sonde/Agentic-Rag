@@ -586,7 +586,7 @@ if messages and messages[-1]["role"] == "user":
         response = httpx.post(
             f"{api_url}/chat",
             json={"question": last_q, "session_id": st.session_state.session_id},
-            timeout=120,
+            timeout=300,
         )
         response.raise_for_status()
         data = response.json()

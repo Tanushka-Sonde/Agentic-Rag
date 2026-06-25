@@ -66,6 +66,7 @@ services:
     container_name: ey_rag_init
     volumes:
       - .:/app
+      - hf_cache:/root/.cache/huggingface
     command: python scripts/init_db.py
     profiles: [ "tools" ] # won't start with plain `docker compose up`
 
@@ -82,6 +83,7 @@ services:
     volumes:
       - .:/app
       - ${DOCS_PATH:-./data}:/data
+      - hf_cache:/root/.cache/huggingface   # persist the ~5GB ColPali model
     command: >
       python scripts/ingest.py
         --path /data
@@ -95,6 +97,7 @@ services:
       - "8000:8000"
     volumes:
       - .:/app # hot-reload: code changes reflect immediately
+      - hf_cache:/root/.cache/huggingface   # reuse the cached ColPali model
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
   # ── Streamlit UI ───────────────────────────────────────────────────────────
@@ -126,3 +129,4 @@ services:
 
 volumes:
   postgres_data:
+  hf_cache:

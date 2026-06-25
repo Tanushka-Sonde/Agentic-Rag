@@ -34,13 +34,15 @@ from pathlib import Path
 
 from PIL import Image
 
-# ColPali via byaldi
+# ColPali via colpali-engine (the model library byaldi is built on).
+# We use it directly because we need the raw page/query embeddings to
+# average-pool and store in Pinecone — byaldi only exposes its own index.
 try:
-    from byaldi import RAGMultiModalModel
+    from colpali_engine.models import ColPali, ColPaliProcessor
     COLPALI_AVAILABLE = True
 except ImportError:
     COLPALI_AVAILABLE = False
-    print("⚠️  byaldi not installed. ColPali retrieval disabled. Run: pip install byaldi")
+    print("⚠️  colpali-engine not installed. ColPali retrieval disabled.")
 
 
 @dataclass
@@ -67,17 +69,27 @@ class ColPaliEmbedder:
 
     def __init__(self) -> None:
         if not COLPALI_AVAILABLE:
-            raise RuntimeError("byaldi not installed. Run: pip install byaldi")
-        self._model: RAGMultiModalModel | None = None
+            raise RuntimeError("colpali-engine not installed.")
+        self._model = None
+        self._processor = None
+        self._device = None
 
-    def _get_model(self) -> RAGMultiModalModel:
-        """Lazy load ColPali model (downloads on first use ~5GB)."""
+    def _get_model(self):
+        """Lazy load ColPali model + processor (downloads on first use ~5GB)."""
         if self._model is None:
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._device = device
+            # bfloat16 is ColPali's native dtype and halves RAM (~6GB vs ~12GB
+            # for float32) so the model fits in a typical Docker memory limit.
+            dtype = torch.bfloat16
             print(f"Loading ColPali model: {self.MODEL_NAME} on {device} (first load downloads ~5GB)...")
-            # Force explicit device to avoid 'meta tensor' issues in some environments
-            self._model = RAGMultiModalModel.from_pretrained(self.MODEL_NAME, device=device)
+            self._model = ColPali.from_pretrained(
+                self.MODEL_NAME,
+                torch_dtype=dtype,
+                device_map=device,
+            ).eval()
+            self._processor = ColPaliProcessor.from_pretrained(self.MODEL_NAME)
             print("ColPali model loaded.")
         return self._model
 
@@ -196,30 +208,23 @@ class ColPaliEmbedder:
         Embed a list of ColPaliPages using the ColPali model.
         Returns list of (page, embedding_vector) tuples.
 
-        Note: ColPali produces multi-vector embeddings (one vector per patch).
-        For Pinecone compatibility we average-pool to a single vector.
-        For best results use a ColPali-native store like Qdrant with late interaction.
+        ColPali produces multi-vector embeddings (one vector per image patch).
+        For Pinecone compatibility we average-pool to a single 128-dim vector.
         """
-        model = self._get_model()
+        import torch
+        self._get_model()
         results: list[tuple[ColPaliPage, list[float]]] = []
 
         for page in pages:
             try:
-                # Decode base64 back to PIL Image
                 img_bytes = base64.b64decode(page.page_image_b64)
                 pil_img   = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
-                # Get ColPali embedding (returns tensor of shape [num_patches, dim])
-                import torch
+                batch = self._processor.process_images([pil_img]).to(self._device)
                 with torch.no_grad():
-                    embedding_tensor = model.encode_image(pil_img)
+                    emb = self._model(**batch)        # [1, num_patches, 128]
 
-                # Average pool across patches → single vector
-                if hasattr(embedding_tensor, "mean"):
-                    avg_vector = embedding_tensor.mean(dim=0).tolist()
-                else:
-                    avg_vector = list(embedding_tensor)
-
+                avg_vector = emb[0].float().mean(dim=0).tolist()
                 results.append((page, avg_vector))
             except Exception as e:
                 print(f"ColPali embed failed for {page.source_file} page {page.page_idx}: {e}")
@@ -227,14 +232,10 @@ class ColPaliEmbedder:
         return results
 
     def embed_query(self, query: str) -> list[float]:
-        """
-        Embed a text query for ColPali retrieval.
-        ColPali uses a text encoder for queries (same late-interaction model).
-        """
-        model = self._get_model()
+        """Embed a text query for ColPali retrieval (average-pooled to 128-dim)."""
         import torch
+        self._get_model()
+        batch = self._processor.process_queries([query]).to(self._device)
         with torch.no_grad():
-            embedding_tensor = model.encode_query(query)
-        if hasattr(embedding_tensor, "mean"):
-            return embedding_tensor.mean(dim=0).tolist()
-        return list(embedding_tensor)
+            emb = self._model(**batch)                # [1, seq_len, 128]
+        return emb[0].float().mean(dim=0).tolist()

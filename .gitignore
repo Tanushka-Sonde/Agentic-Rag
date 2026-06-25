@@ -92,3 +92,4 @@ Thumbs.db
 # Streamlit
 .streamlit/secrets.toml
 .env.save
+ey_rag_backup.sql

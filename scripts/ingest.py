@@ -214,14 +214,22 @@ async def main():
             colpali_embedder = ColPaliEmbedder()
             colpali_indexer  = ColPaliIndexer()
             await colpali_indexer.init_db()
+            # Load the model ONCE up front so the parallel files don't each
+            # trigger a duplicate ~5GB load (the earlier race condition).
+            print("⏳ Loading ColPali model once (CPU — this is slow)…")
+            colpali_embedder._get_model()
             print("✅ ColPali indexer ready")
         except Exception as e:
             print(f"⚠️  ColPali init failed: {e}. Chunk pipeline only.")
             colpali_embedder = None
             colpali_indexer  = None
 
-    # ── Parallel ingestion ────────────────────────────────────────────────────
-    sem = asyncio.Semaphore(FILE_CONCURRENCY)
+    # ── Ingestion ─────────────────────────────────────────────────────────────
+    # ColPali shares one non-thread-safe model on CPU, so serialize files when
+    # it's enabled. Otherwise process several files in parallel for speed.
+    effective_concurrency = 1 if (COLPALI_ENABLED and colpali_embedder) else FILE_CONCURRENCY
+    print(f"⚙️  File concurrency: {effective_concurrency}")
+    sem = asyncio.Semaphore(effective_concurrency)
     tasks = [
         ingest_file(f, indexer, colpali_embedder, colpali_indexer, sem)
         for f in files

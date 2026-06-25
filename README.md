@@ -519,3 +519,7 @@ Invoke-WebRequest -Uri "http://localhost:8000/chat" `
 
 
 
+
+
+
+docker compose up -d

@@ -65,6 +65,22 @@ class ColPaliIndexer:
 
     UPSERT_BATCH = 50
 
+    @staticmethod
+    def _as_text(value) -> str:
+        """Coerce metadata to a TEXT-safe string (LLM may return lists)."""
+        if value is None:
+            return ""
+        if isinstance(value, (list, tuple, set)):
+            return ", ".join(str(v) for v in value)
+        return str(value)
+
+    @staticmethod
+    def _as_int(value) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     def __init__(self, engine: AsyncEngine | None = None) -> None:
         pc = Pinecone(api_key=settings.pinecone_api_key)
 
@@ -114,11 +130,11 @@ class ColPaliIndexer:
                 "source_file":  page.source_file,
                 "doc_type":     page.doc_type,
                 "page_idx":     page.page_idx,
-                "engagement_id": page.metadata.get("engagement_id", ""),
-                "client":       page.metadata.get("client", ""),
-                "country":      page.metadata.get("country", ""),
-                "practice":     page.metadata.get("practice", ""),
-                "year":         page.metadata.get("year", 0),
+                "engagement_id": self._as_text(page.metadata.get("engagement_id", "")),
+                "client":       self._as_text(page.metadata.get("client", "")),
+                "country":      self._as_text(page.metadata.get("country", "")),
+                "practice":     self._as_text(page.metadata.get("practice", "")),
+                "year":         self._as_int(page.metadata.get("year")) or 0,
             }
             records.append({
                 "id":       page_id,
@@ -163,11 +179,11 @@ class ColPaliIndexer:
                         "doc_type":      page.doc_type,
                         "page_idx":      page.page_idx,
                         "page_image_b64": page.page_image_b64,
-                        "engagement_id": meta.get("engagement_id", ""),
-                        "client":        meta.get("client", ""),
-                        "country":       meta.get("country", ""),
-                        "practice":      meta.get("practice", ""),
-                        "year":          meta.get("year"),
+                        "engagement_id": self._as_text(meta.get("engagement_id", "")),
+                        "client":        self._as_text(meta.get("client", "")),
+                        "country":       self._as_text(meta.get("country", "")),
+                        "practice":      self._as_text(meta.get("practice", "")),
+                        "year":          self._as_int(meta.get("year")),
                         "extra_metadata": json.dumps(extra),
                     })
 
