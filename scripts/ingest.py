@@ -67,7 +67,6 @@ async def filter_new_chunks(chunks: list, indexer: DocumentIndexer) -> tuple[lis
             params,
         )
         existing_ids = {row[0] for row in result.fetchall()}
-
     new_chunks = [c for c in chunks if c.chunk_id not in existing_ids]
     skipped    = len(chunks) - len(new_chunks)
     return new_chunks, skipped
