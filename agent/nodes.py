@@ -31,6 +31,7 @@ from agent.prompts import (
     QUERY_REWRITE_PROMPT,
     REFLECTION_PROMPT,
     RERANK_PROMPT,
+    RETRIEVAL_GRADE_PROMPT,
 )
 from agent.tools import (
     colpali_retrieval,
@@ -157,8 +158,41 @@ async def retriever_node(state: AgentState) -> dict:
 # ── Node 3: Retrieval Grader (pass-through) ────────────────────────────────────
 
 async def retrieval_grader_node(state: AgentState) -> dict:
-    return {"graded_chunks": state["raw_chunks"]}
+    question = state["question"]
+    chunks   = state["raw_chunks"]
 
+    if not chunks:
+        return {"graded_chunks": []}
+
+    async def grade_one(chunk: dict) -> dict | None:
+        content = chunk.get("content_preview", "")[:400]
+        prompt  = RETRIEVAL_GRADE_PROMPT.format(question=question, chunk=content)
+        try:
+            response = await _llm_json.ainvoke(prompt)
+            result   = json.loads(response.content)
+            if result.get("relevant", False):
+                return chunk
+        except Exception:
+            return chunk
+        return None
+
+    batch_size = 10
+    graded: list[dict] = []
+    for i in range(0, len(chunks), batch_size):
+        batch   = chunks[i : i + batch_size]
+        results = await asyncio.gather(*[grade_one(c) for c in batch])
+        graded.extend([r for r in results if r is not None])
+
+    # ← CHANGED: only fall back if at least some chunks scored reasonably well
+    # Don't force bad context — return empty and let the generator handle it
+    if not graded:
+        # Check top chunk score — if it's very low, nothing is relevant
+        top_score = chunks[0].get("score", 0) if chunks else 0
+        if top_score > 0.4:   # only use fallback if chunks are at least somewhat relevant
+            graded = chunks[:3]
+        # else: return empty → generator will give a sensible "not found" or general answer
+
+    return {"graded_chunks": graded}
 
 # ── Node 4: Reranker (OpenAI LLM-based cross-encoder) ──────────────────────────
 

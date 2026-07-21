@@ -1,7 +1,9 @@
 """
-api/schemas.py
+api/schemas.py   [CHANGE 2 + CHANGE 4 — modified]
 ───────────────
-Pydantic v2 request/response models for the FastAPI layer.
+Change 2: ChatResponse gains agent_name, code, image_b64, chart_type.
+Change 4: New StopResponse schema.
+All existing schemas unchanged.
 """
 
 from __future__ import annotations
@@ -11,12 +13,12 @@ from pydantic import BaseModel, Field
 
 class ChatRequest(BaseModel):
     question:   str            = Field(..., min_length=1, max_length=2000)
-    session_id: str | None     = Field(None, description="Omit to start a new session.")
-    filters:    dict[str, Any] | None = Field(None, description="country, practice, year, doc_type")
+    session_id: str | None     = Field(None)
+    filters:    dict[str, Any] | None = Field(None)
 
 
 class IngestRequest(BaseModel):
-    file_path: str             = Field(..., description="Absolute path to the document on the server")
+    file_path: str
     metadata:  dict[str, Any] | None = Field(None)
 
 
@@ -28,17 +30,28 @@ class Citation(BaseModel):
     section:       str
     engagement_id: str
     doc_type:      str
-    kind:          str = "text"   # text | table | image
+    kind:          str = "text"
 
 
 class ChatResponse(BaseModel):
     session_id:       str
     answer:           str
     citations:        list[Citation]
-    tables:           list[str]   # markdown table strings extracted from the answer
+    tables:           list[str]
     queries_used:     list[str]
     chunks_retrieved: int
     latency_ms:       int
+    # Change 2 — multi-agent fields
+    agent_name:       str        = "retrieval"
+    code:             str | None = None
+    image_b64:        str | None = None
+    chart_type:       str | None = None
+
+
+# Change 4
+class StopResponse(BaseModel):
+    session_id: str
+    cancelled:  bool
 
 
 class ResetResponse(BaseModel):
