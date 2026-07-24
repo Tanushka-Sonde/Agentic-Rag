@@ -72,6 +72,7 @@ if not _config_path.exists():
 
 import httpx
 import streamlit as st
+import streamlit.components.v1 as components
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 
@@ -171,37 +172,66 @@ def send_feedback(message_text: str, rating: str):
 
 
 def copy_button(text: str, key: str):
-    """A plain JS clipboard button — copies exactly the response text, no
-    Streamlit rerun involved, so it responds instantly. Falls back to
-    execCommand('copy') because navigator.clipboard only works in a secure
-    context (HTTPS or localhost) and fails silently everywhere else."""
+    """A real Streamlit component (components.html) rather than an inline
+    onclick attribute in st.markdown — inline event-handler attributes get
+    silently blocked by Content-Security-Policy in a lot of environments,
+    which is why the previous version did nothing. A <script> tag inside
+    components.html actually executes, so this works reliably. Falls back
+    to execCommand('copy') because navigator.clipboard requires a secure
+    context (HTTPS or localhost).
+
+    Uses an inline SVG icon (not a unicode glyph) since glyph rendering is
+    inconsistent across fonts, and explicitly transparent backgrounds since
+    components.html's iframe otherwise shows as an opaque box that doesn't
+    match the page theme."""
     payload_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
-    st.markdown(
-        f"""
-        <button class="copy-btn" title="Copy response" onclick="
-            const el = this;
-            const txt = decodeURIComponent(escape(window.atob('{payload_b64}')));
-            function mark() {{ el.innerText='✓'; setTimeout(() => el.innerText='⧉', 1200); }}
-            if (navigator.clipboard && window.isSecureContext) {{
-                navigator.clipboard.writeText(txt).then(mark).catch(() => fallback());
-            }} else {{
-                fallback();
-            }}
-            function fallback() {{
-                const ta = document.createElement('textarea');
-                ta.value = txt;
-                ta.style.position = 'fixed';
-                ta.style.opacity = '0';
-                document.body.appendChild(ta);
-                ta.focus();
-                ta.select();
-                try {{ document.execCommand('copy'); mark(); }} catch (e) {{}}
-                document.body.removeChild(ta);
-            }}
-        ">⧉</button>
-        """,
-        unsafe_allow_html=True,
-    )
+    html = f"""
+    <style>
+      html, body {{ margin:0; padding:0; background:transparent; }}
+      .copy-btn {{
+          display:inline-flex; align-items:center; justify-content:center;
+          width:28px; height:28px; border-radius:6px;
+          border:1px solid rgba(150,150,150,0.35); background:transparent;
+          cursor:pointer; opacity:0.7; transition:opacity .12s, border-color .12s;
+          color:#9AA0A6;
+      }}
+      .copy-btn:hover {{ opacity:1; border-color:#8A6D3B; color:#8A6D3B; }}
+      .copy-btn svg {{ width:14px; height:14px; }}
+    </style>
+    <button id="copy-{key}" class="copy-btn" title="Copy response">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round">
+        <rect x="9" y="9" width="13" height="13" rx="2"></rect>
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+      </svg>
+    </button>
+    <script>
+      const btn = document.getElementById("copy-{key}");
+      btn.addEventListener("click", function() {{
+          const txt = decodeURIComponent(escape(window.atob("{payload_b64}")));
+          function mark() {{
+              btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+              setTimeout(() => {{
+                  btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+              }}, 1200);
+          }}
+          function fallback() {{
+              const ta = document.createElement("textarea");
+              ta.value = txt;
+              document.body.appendChild(ta);
+              ta.select();
+              try {{ document.execCommand("copy"); mark(); }} catch (e) {{}}
+              document.body.removeChild(ta);
+          }}
+          if (navigator.clipboard) {{
+              navigator.clipboard.writeText(txt).then(mark).catch(fallback);
+          }} else {{
+              fallback();
+          }}
+      }});
+    </script>
+    """
+    components.html(html, height=32)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -223,6 +253,14 @@ class StreamState:
         self.stopped = False
         self.error = None
 
+        # Owning our own client (instead of one-off httpx.stream/post calls)
+        # is what makes an instant hard-stop possible: closing this client
+        # from the button-click thread aborts whatever socket read the
+        # worker thread is blocked on right now — whether that's mid-token
+        # or still waiting on retrieval before the first byte arrives, where
+        # checking a flag inside the read loop wouldn't help because the
+        # loop never gets a turn to check it.
+        self.client = httpx.Client(timeout=300)
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
@@ -232,6 +270,12 @@ class StreamState:
     def request_stop(self):
         self.stop_event.set()
         try:
+            self.client.close()  # forces any in-flight request to abort now
+        except Exception:
+            pass
+        try:
+            # best-effort: also tell the backend to cancel retrieval/LLM
+            # work server-side, independent of the client-side abort above
             httpx.post(f"{API_URL}/chat/stop", params={"session_id": self.session_id}, timeout=5)
         except Exception:
             pass
@@ -252,21 +296,37 @@ class StreamState:
         try:
             self._run_stream()
         except Exception:
-            try:
-                self._run_fallback()
-            except Exception as e:
+            if self.stop_event.is_set():
+                # the exception here IS the forced abort from request_stop —
+                # not a real backend failure — so don't fall back to a fresh
+                # non-streaming call, just record that we stopped.
                 with self.lock:
-                    self.error = str(e)
+                    self.stopped = True
+            else:
+                try:
+                    self._run_fallback()
+                except Exception as e:
+                    if self.stop_event.is_set():
+                        with self.lock:
+                            self.stopped = True
+                    else:
+                        with self.lock:
+                            self.error = str(e)
         finally:
             with self.lock:
                 self.done = True
+            try:
+                self.client.close()
+            except Exception:
+                pass
 
     def _run_stream(self):
-        with httpx.stream(
+        if self.stop_event.is_set():
+            return
+        with self.client.stream(
             "POST",
             f"{API_URL}/chat/stream",
             json={"question": self.question, "session_id": self.session_id, "top_k": self.top_k},
-            timeout=300,
         ) as resp:
             if resp.status_code == 404:
                 raise RuntimeError("no streaming endpoint")
@@ -275,10 +335,6 @@ class StreamState:
                 if self.stop_event.is_set():
                     with self.lock:
                         self.stopped = True
-                    try:
-                        resp.close()
-                    except Exception:
-                        pass
                     return
                 if not line:
                     continue
@@ -299,10 +355,11 @@ class StreamState:
                         self.image_b64 = evt.get("image_b64")
 
     def _run_fallback(self):
-        resp = httpx.post(
+        if self.stop_event.is_set():
+            return
+        resp = self.client.post(
             f"{API_URL}/chat",
             json={"question": self.question, "session_id": self.session_id, "top_k": self.top_k},
-            timeout=300,
         )
         resp.raise_for_status()
         data = resp.json()
