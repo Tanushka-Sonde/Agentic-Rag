@@ -51,7 +51,13 @@ class SpecialisedAgent(ABC):
     def can_handle(self, query: str) -> bool: ...
 
     @abstractmethod
-    async def run(self, question: str, chat_history: list[dict], rag_graph: Any) -> AgentResult: ...
+    async def run(
+        self,
+        question: str,
+        chat_history: list[dict],
+        rag_graph: Any,
+        cancel_token: Any = None,
+    ) -> AgentResult: ...
 
 
 class ChitchatAgent(SpecialisedAgent):
@@ -67,7 +73,7 @@ class ChitchatAgent(SpecialisedAgent):
     def can_handle(self, query: str) -> bool:
         return bool(self._TRIGGERS.match(query.strip()))
 
-    async def run(self, question, chat_history, rag_graph) -> AgentResult:
+    async def run(self, question, chat_history, rag_graph, cancel_token=None) -> AgentResult:
         messages = [
             {"role": "system", "content": CHITCHAT_SYSTEM_PROMPT},
             *chat_history[-4:],
@@ -83,8 +89,8 @@ class RetrievalAgent(SpecialisedAgent):
     def can_handle(self, query: str) -> bool:
         return True
 
-    async def run(self, question, chat_history, rag_graph) -> AgentResult:
-        state = await _invoke_rag_graph(rag_graph, question, chat_history)
+    async def run(self, question, chat_history, rag_graph, cancel_token=None) -> AgentResult:
+        state = await _invoke_rag_graph(rag_graph, question, chat_history, cancel_token)
         return AgentResult(
             agent_name="retrieval",
             answer=state.get("final_answer") or state.get("answer", ""),
@@ -98,7 +104,9 @@ class RetrievalAgent(SpecialisedAgent):
 # Pulled out of RetrievalAgent so CodeGraphAgent can reuse the exact same
 # retrieval path instead of guessing/inventing numbers of its own.
 
-async def _invoke_rag_graph(rag_graph: Any, question: str, chat_history: list[dict]) -> dict:
+async def _invoke_rag_graph(
+    rag_graph: Any, question: str, chat_history: list[dict], cancel_token: Any = None,
+) -> dict:
     return await rag_graph.ainvoke({
         "question": question, "chat_history": chat_history,
         "reflection_loops": 0, "raw_chunks": [], "colpali_pages": [],
@@ -106,7 +114,12 @@ async def _invoke_rag_graph(rag_graph: Any, question: str, chat_history: list[di
         "page_images": [], "citations": [], "tables": [],
         "rewritten_queries": [], "context": "", "answer": "",
         "final_answer": "", "reflection_result": {},
+        # Wired through so every node in the graph can check it — see
+        # agent/nodes.py's _check_cancelled(). Without this, /chat/stop
+        # only ever aborted the client's own connection.
+        "cancel_token": cancel_token,
     })
+
 
 
 # ── Chart / graph generation — now GROUNDED in retrieved KB data ─────────────
@@ -273,10 +286,10 @@ class CodeGraphAgent(SpecialisedAgent):
 
         return "\n\n---\n\n".join(p for p in parts if p).strip()
 
-    async def run(self, question, chat_history, rag_graph) -> AgentResult:
+    async def run(self, question, chat_history, rag_graph, cancel_token=None) -> AgentResult:
         # 1. Standard retrieval — same path every other agent uses, gives us
         #    citations plus a baseline answer/context.
-        state = await _invoke_rag_graph(rag_graph, question, chat_history)
+        state = await _invoke_rag_graph(rag_graph, question, chat_history, cancel_token)
         citations = state.get("citations", [])
 
         # 2. Widen the net specifically for charting. The standard pipeline
@@ -336,7 +349,7 @@ class CodeGraphAgent(SpecialisedAgent):
         code = re.sub(r"^\s*plt\.savefig\([^)]*\)\s*$", "", code, flags=re.MULTILINE)
         code = re.sub(r"^\s*plt\.show\(\)\s*$", "", code, flags=re.MULTILINE)
 
-        image_b64, render_error = await _execute_chart_code(code)
+        image_b64, render_error = await _execute_chart_code(code, cancel_token)
 
         if image_b64 is None:
             # Rendering failed — don't pretend nothing happened, and don't
@@ -371,20 +384,26 @@ class CodeGraphAgent(SpecialisedAgent):
         )
 
 
-async def _execute_chart_code(code: str) -> tuple[str | None, str | None]:
+async def _execute_chart_code(code: str, cancel_token: Any = None) -> tuple[str | None, str | None]:
     """
     Execute LLM-generated matplotlib code in an isolated subprocess.
 
     Returns (image_b64, error):
       - On success:  (base64_png, None)
       - On failure:  (None, human-readable reason — traceback, stderr,
-                      timeout message, or launch failure) so the caller can
-                      log *why* it failed instead of just that it failed.
+                      timeout message, cancellation, or launch failure) so
+                      the caller can log *why* it failed instead of just
+                      that it failed.
 
     The LLM's own code is now INSIDE the same try/except as the savefig
     step (previously it wasn't — an error in the LLM's code, e.g. a typo'd
     column name, would crash the whole subprocess before the try/except
     even started, and get silently discarded).
+
+    cancel_token, if given, is raced against the subprocess: previously
+    this ran to completion no matter what — clicking Stop only ever
+    aborted the browser's own connection while the subprocess (and the
+    CPU it was using) kept going server-side regardless.
     """
     indented_code = textwrap.indent(code, "    ")
     wrapper = textwrap.dedent(f"""
@@ -409,17 +428,43 @@ except Exception:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        stdout_text = stdout.decode(errors="replace")
-        for line in stdout_text.splitlines():
-            if line.startswith("BASE64:"):
-                return line[7:], None
-        error = stderr.decode(errors="replace").strip()
-        return None, error or "Subprocess exited with no BASE64 output and no stderr."
-    except asyncio.TimeoutError:
-        return None, "Chart rendering timed out after 30s."
     except Exception as e:
         return None, f"Failed to launch chart subprocess: {e!r}"
+
+    communicate_task = asyncio.ensure_future(proc.communicate())
+    waiters = {communicate_task}
+    cancel_wait_task = None
+    if cancel_token is not None:
+        cancel_wait_task = asyncio.ensure_future(cancel_token.wait())
+        waiters.add(cancel_wait_task)
+
+    try:
+        done, pending = await asyncio.wait(waiters, timeout=30, return_when=asyncio.FIRST_COMPLETED)
+    except Exception as e:
+        proc.kill()
+        return None, f"Chart execution failed: {e!r}"
+
+    if cancel_wait_task is not None and cancel_wait_task in done:
+        proc.kill()
+        communicate_task.cancel()
+        return None, "Chart generation cancelled by user."
+
+    if communicate_task not in done:
+        proc.kill()
+        if cancel_wait_task is not None:
+            cancel_wait_task.cancel()
+        return None, "Chart rendering timed out after 30s."
+
+    if cancel_wait_task is not None:
+        cancel_wait_task.cancel()
+
+    stdout, stderr = communicate_task.result()
+    stdout_text = stdout.decode(errors="replace")
+    for line in stdout_text.splitlines():
+        if line.startswith("BASE64:"):
+            return line[7:], None
+    error = stderr.decode(errors="replace").strip()
+    return None, error or "Subprocess exited with no BASE64 output and no stderr."
 
 
 _FLOWCHART_SYSTEM = """\
@@ -442,7 +487,7 @@ class FlowchartAgent(SpecialisedAgent):
     def can_handle(self, query: str) -> bool:
         return bool(_FLOWCHART_TRIGGERS.search(query))
 
-    async def run(self, question, chat_history, rag_graph) -> AgentResult:
+    async def run(self, question, chat_history, rag_graph, cancel_token=None) -> AgentResult:
         messages = [{"role": "system", "content": _FLOWCHART_SYSTEM}, *chat_history[-4:], {"role": "user", "content": question}]
         response = await _llm.ainvoke(messages)
         mermaid_code = re.sub(r"^```(?:mermaid)?\s*", "", response.content.strip(), flags=re.MULTILINE)
@@ -465,7 +510,7 @@ class ImageGenerationAgent(SpecialisedAgent):
     def can_handle(self, query: str) -> bool:
         return bool(_IMAGE_GEN_TRIGGERS.search(query))
 
-    async def run(self, question, chat_history, rag_graph) -> AgentResult:
+    async def run(self, question, chat_history, rag_graph, cancel_token=None) -> AgentResult:
         try:
             resp = await _openai_client.images.generate(model="dall-e-3", prompt=question, size="1024x1024", quality="standard", n=1, response_format="b64_json")
             image_b64 = resp.data[0].b64_json
@@ -486,13 +531,17 @@ AGENT_REGISTRY: list[SpecialisedAgent] = [
 ]
 
 
-async def route_and_run(question: str, chat_history: list[dict], rag_graph: Any) -> AgentResult:
+async def route_and_run(
+    question: str, chat_history: list[dict], rag_graph: Any, cancel_token: Any = None,
+) -> AgentResult:
     # Fast path — regex triggers
     for agent in AGENT_REGISTRY[:-1]:
         if agent.can_handle(question):
-            return await agent.run(question, chat_history, rag_graph)
+            return await agent.run(question, chat_history, rag_graph, cancel_token)
 
     # Slow path — LLM intent classification
+    if cancel_token is not None:
+        await cancel_token.raise_if_cancelled()
     try:
         resp = await _llm_json.ainvoke([
             {"role": "system", "content": "You are a query classifier."},
@@ -507,9 +556,9 @@ async def route_and_run(question: str, chat_history: list[dict], rag_graph: Any)
     elif intent == "visual":
         for a in AGENT_REGISTRY:
             if a.name in ("flowchart", "code_graph") and a.can_handle(question):
-                return await a.run(question, chat_history, rag_graph)
+                return await a.run(question, chat_history, rag_graph, cancel_token)
         agent = AGENT_REGISTRY[-1]
     else:
         agent = AGENT_REGISTRY[-1]
 
-    return await agent.run(question, chat_history, rag_graph)
+    return await agent.run(question, chat_history, rag_graph, cancel_token)

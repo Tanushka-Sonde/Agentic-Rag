@@ -78,6 +78,20 @@ class AgentState(TypedDict):
     reflection_loops:  int
     reflection_result: dict
     final_answer:      str
+    cancel_token:       Any        # CancellationToken | None — checked at every node
+
+
+async def _check_cancelled(state: AgentState) -> None:
+    """
+    Call at the top of every node. Previously nothing in this pipeline ever
+    looked at cancellation — /chat/stop only aborted the client's own HTTP
+    connection, while retrieval/rerank/generation kept running to
+    completion on the server regardless. This makes "Stop" actually stop
+    work, node by node, instead of just walking away from a socket.
+    """
+    token = state.get("cancel_token")
+    if token is not None:
+        await token.raise_if_cancelled()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -106,6 +120,7 @@ def _extract_tables(text: str) -> list[str]:
 # ── Node 1: Query Rewriter ─────────────────────────────────────────────────────
 
 async def query_rewriter_node(state: AgentState) -> dict:
+    await _check_cancelled(state)
     history_str = "\n".join(
         f"{m['role'].upper()}: {m['content']}"
         for m in state["chat_history"][-6:]
@@ -133,6 +148,7 @@ async def query_rewriter_node(state: AgentState) -> dict:
 
 async def retriever_node(state: AgentState) -> dict:
     """Run hybrid chunk + ColPali page retrieval in parallel."""
+    await _check_cancelled(state)
     queries = state["rewritten_queries"]
 
     chunk_tasks  = [hybrid_retrieval(q, top_k=settings.max_retrieval_k) for q in queries]
@@ -158,6 +174,7 @@ async def retriever_node(state: AgentState) -> dict:
 # ── Node 3: Retrieval Grader (pass-through) ────────────────────────────────────
 
 async def retrieval_grader_node(state: AgentState) -> dict:
+    await _check_cancelled(state)
     question = state["question"]
     chunks   = state["raw_chunks"]
 
@@ -201,6 +218,7 @@ async def reranker_node(state: AgentState) -> dict:
     Rerank candidate chunks for relevance using an OpenAI LLM (replaces Cohere).
     Falls back to embedding-score ordering if the LLM call fails.
     """
+    await _check_cancelled(state)
     chunks = state["graded_chunks"]
     if not chunks:
         return {"reranked_chunks": []}
@@ -245,6 +263,7 @@ async def reranker_node(state: AgentState) -> dict:
 
 async def context_builder_node(state: AgentState) -> dict:
     """Fetch full chunk text + ColPali page images; build text context."""
+    await _check_cancelled(state)
     chunks       = state["reranked_chunks"]
     colpali_hits = state.get("colpali_pages", [])
 
@@ -314,6 +333,7 @@ async def generator_node(state: AgentState) -> dict:
     Extracts markdown tables from the answer and returns them separately.
     """
     page_images = state.get("page_images", [])
+    await _check_cancelled(state)
     prompt_text = GENERATION_PROMPT.format(
         question=state["question"],
         context=state["context"],
@@ -363,6 +383,7 @@ async def generator_node(state: AgentState) -> dict:
 # ── Node 7: Reflection Grader ──────────────────────────────────────────────────
 
 async def reflection_grader_node(state: AgentState) -> dict:
+    await _check_cancelled(state)
     if settings.max_reflection_loops == 0:
         return {
             "reflection_result": {"quality": "good"},
@@ -399,6 +420,7 @@ def should_retry(state: AgentState) -> str:
 # ── Node 9: Retry Prep ─────────────────────────────────────────────────────────
 
 async def retry_prep_node(state: AgentState) -> dict:
+    await _check_cancelled(state)
     followup = state["reflection_result"].get("suggested_followup_query", state["question"])
     return {
         "question":         followup,

@@ -471,9 +471,13 @@ for i, msg in enumerate(messages):
         if msg["role"] == "assistant":
             if msg.get("image_b64"):
                 try:
-                    st.image(base64.b64decode(msg["image_b64"]), use_container_width=True)
-                except Exception:
-                    pass
+                    # NOTE: Streamlit 1.39 does not support use_container_width
+                    # on st.image() (only use_column_width) — passing it raised
+                    # a TypeError that this try/except was silently swallowing,
+                    # so a successfully-generated chart never appeared at all.
+                    st.image(base64.b64decode(msg["image_b64"]), use_column_width=True)
+                except Exception as e:
+                    st.warning(f"Chart image failed to render: {e}")
 
             if msg.get("agent_steps") and st.session_state.show_steps:
                 with st.expander("Retrieval trace"):

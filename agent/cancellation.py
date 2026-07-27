@@ -34,6 +34,15 @@ class CancellationToken:
         if self._event.is_set():
             raise asyncio.CancelledError("Generation stopped by user.")
 
+    async def wait(self) -> None:
+        """
+        Awaitable that resolves the moment cancel() is called.
+        Used to race against long-running I/O (e.g. a chart subprocess)
+        with asyncio.wait(..., return_when=FIRST_COMPLETED) so that work
+        can be killed immediately instead of only checked between steps.
+        """
+        await self._event.wait()
+
 
 class CancellationRegistry:
     """Maps session_id → CancellationToken for all in-flight requests."""

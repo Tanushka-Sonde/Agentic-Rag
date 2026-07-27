@@ -134,11 +134,21 @@ async def chat(
 
     graph = get_graph()
     try:
-        # Change 2: delegate to multi-agent router
+        # Change 2 + 6: delegate to multi-agent router, now WITH the
+        # cancellation token forwarded. Previously `token` was registered
+        # above but never actually passed in here — /chat/stop only ever
+        # aborted the client's own connection while retrieval/rerank/
+        # generation/chart-rendering kept running to completion
+        # server-side regardless of the stop click. route_and_run forwards
+        # this into every agent's run() and into the LangGraph state
+        # (checked by every node — see agent/nodes.py's _check_cancelled),
+        # and into the chart subprocess (see agent/multi_agent.py's
+        # _execute_chart_code), so Stop now actually stops the work.
         result = await route_and_run(
             question=request.question,
             chat_history=history,
             rag_graph=graph,
+            cancel_token=token,
         )
     except asyncio.CancelledError:
         # Change 4: request was cancelled via /chat/stop
