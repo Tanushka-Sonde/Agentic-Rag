@@ -68,6 +68,7 @@ build/
 venv/
 .venv/
 env/
+.env.tanu
 ENV/
 env.bak/
 venv.bak/
