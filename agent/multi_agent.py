@@ -369,11 +369,7 @@ class CodeGraphAgent(SpecialisedAgent):
             )
             return AgentResult(agent_name="code_graph", answer=answer, code=code, citations=citations)
 
-        answer = (
-            "Here's the chart, built from data retrieved from the EY "
-            "knowledge base (not invented).\n\n"
-            f"**Code used:**\n```python\n{code}\n```"
-        )
+        answer = await self._explain_chart(question, context, code)
         return AgentResult(
             agent_name="code_graph",
             answer=answer,
@@ -382,6 +378,49 @@ class CodeGraphAgent(SpecialisedAgent):
             chart_type="matplotlib",
             citations=citations,
         )
+
+    async def _explain_chart(self, question: str, context: str, code: str) -> str:
+        """
+        Produce the chat-facing text for a successfully rendered chart.
+
+        Previously this just dumped the raw matplotlib code into the answer
+        (wrapped in a ```python fence), which is why the UI showed a code
+        block sitting on top of the image — useful for a developer, not for
+        a consultant asking "chart X for me". The code is still returned via
+        AgentResult.code for anyone who wants it later; the chat answer
+        itself should just be the kind of one-paragraph gloss a consulting
+        analyst would give when handing over a chart: what it shows, and any
+        caveat (e.g. an excluded category) worth flagging.
+        """
+        prompt = f"""\
+A chart has just been generated and will be shown to the user directly below your reply.
+
+User's request:
+{question}
+
+Data the chart was built from:
+{context[:2500]}
+
+Chart-building code (for your reference only — do NOT reproduce, quote, or mention code, \
+Python, or matplotlib in your reply):
+{code}
+
+Write a short (2-4 sentence) consulting-style caption for this chart:
+- State what the chart shows in plain language.
+- Call out the standout data point(s) or comparison.
+- If the chart's code excludes a category (e.g. via an ax.text footnote) because the \
+source language was too vague to count, mention that exclusion and why in one clause.
+- Do NOT mention "source", "document", "page", or "retrieved context" — just describe the data.
+- Do NOT include any code, code fences, or the word "matplotlib".
+"""
+        try:
+            response = await _llm.ainvoke([{"role": "user", "content": prompt}])
+            explanation = response.content.strip()
+            # Belt-and-suspenders: strip any code fence the model adds anyway.
+            explanation = re.sub(r"```.*?```", "", explanation, flags=re.DOTALL).strip()
+            return explanation or "Here's the chart, built from data in the EY knowledge base."
+        except Exception:
+            return "Here's the chart, built from data in the EY knowledge base."
 
 
 async def _execute_chart_code(code: str, cancel_token: Any = None) -> tuple[str | None, str | None]:
