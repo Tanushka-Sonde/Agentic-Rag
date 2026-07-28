@@ -175,10 +175,32 @@ Technical requirements (only apply if you ARE generating a chart):
   reconfigure the backend).
 - Use the EY brand colours #FFE600, #2E2E38, #00A3A1, cycling through them
   if there are more categories than colours.
+- Create the figure with a fixed, generous size so labels have room to
+  breathe: fig, ax = plt.subplots(figsize=(9, 6)).
+- X-axis category labels: rotate with plt.xticks(rotation=30, ha='right')
+  (30 degrees, not 45+ — steeper angles push labels further down and are
+  more likely to collide with anything placed below the axes).
 - If any category from the source table was left out because its language
-  was too vague to count (e.g. "majority", "mixed practices"), add a
-  small ax.text() footnote below the chart naming which category was
-  excluded and why — don't silently drop it with no explanation.
+  was too vague to count (e.g. "majority", "mixed practices"), you MUST
+  add a footnote — but it MUST NOT collide with the rotated x-axis labels.
+  To guarantee that:
+    1. Place the footnote with fig.text(...) in FIGURE coordinates, not
+       ax.text() in axes coordinates — e.g.
+       fig.text(0.5, 0.02, "Excluded: <category> (<reason>).",
+                ha='center', fontsize=8, style='italic')
+    2. Reserve space for it explicitly with
+       fig.subplots_adjust(bottom=0.30)
+       (increase to 0.35+ if the footnote text is long or category names
+       are long/rotated) so the rotated tick labels and the footnote each
+       get their own vertical band and never overlap.
+    3. Do NOT call plt.tight_layout() in the same script as fig.text() —
+       tight_layout() recalculates margins and will undo the
+       subplots_adjust() reservation, which is what causes the footnote
+       to land on top of the tick labels. Use subplots_adjust() alone.
+  If there is nothing excluded, skip the footnote entirely — don't add an
+  empty or placeholder one.
+- Leave adequate left margin for the y-axis label (subplots_adjust(left=...)
+  if the number labels are wide) and a clear, non-overlapping title.
 - Do NOT call plt.savefig(), plt.show(), or write any file to disk. Just
   build the figure (plt.subplots(), ax.bar()/plot()/etc., labels, title).
   The caller renders and encodes the figure for you after your code runs —
