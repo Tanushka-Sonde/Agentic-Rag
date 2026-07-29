@@ -125,8 +125,17 @@ if "chats" not in st.session_state:
     st.session_state.chats = {cid: _new_chat_dict()}
     st.session_state.current_chat = cid
 
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
+# NOTE: there used to be a single global st.session_state.session_id sent
+# to the backend for every request, regardless of which sidebar
+# conversation was active. Since agent/memory.py's SessionMemory keys its
+# sliding-window history by session_id, that meant "New conversation" (and
+# switching between existing threads) never actually got a clean memory —
+# every thread in the sidebar silently shared and polluted the same
+# backend history. Each chat's own uuid (the dict key in st.session_state
+# .chats) now doubles as its backend session_id, so every thread gets its
+# own isolated memory, exactly like ChatGPT's per-conversation memory. A
+# full page reload resets st.session_state entirely, so all of it — every
+# thread, every session_id — is gone, matching "one session only" scope.
 
 if "top_k" not in st.session_state:
     st.session_state.top_k = 5
@@ -164,7 +173,7 @@ def send_feedback(message_text: str, rating: str):
     try:
         httpx.post(
             f"{API_URL}/feedback",
-            json={"session_id": st.session_state.session_id, "message": message_text, "rating": rating},
+            json={"session_id": st.session_state.current_chat, "message": message_text, "rating": rating},
             timeout=5,
         )
     except Exception:
@@ -413,6 +422,14 @@ with st.sidebar:
         with col2:
             if st.button("×", key=f"del_{chat_id}"):
                 del st.session_state.chats[chat_id]
+                # Free the backend's in-memory history for this thread too —
+                # SessionMemory (agent/memory.py) never expires entries on
+                # its own, so without this a deleted sidebar chat would keep
+                # its history alive server-side indefinitely.
+                try:
+                    httpx.post(f"{API_URL}/chat/reset", params={"session_id": chat_id}, timeout=5)
+                except Exception:
+                    pass
                 if not st.session_state.chats:
                     new_chat()
                 elif st.session_state.current_chat == chat_id:
@@ -555,7 +572,7 @@ def _streaming_fragment(state: "StreamState"):
 
 if messages and messages[-1]["role"] == "user" and st.session_state.stream is None:
     st.session_state.stream = StreamState(
-        messages[-1]["content"], st.session_state.session_id, st.session_state.top_k
+        messages[-1]["content"], st.session_state.current_chat, st.session_state.top_k
     )
     st.session_state.stream.start()
 
